@@ -104,6 +104,11 @@ type Msg struct {
 	Body    string
 }
 
+func (m *Modem) DeleteMsg(idx int) error {
+	_, err := m.Command(fmt.Sprintf("AT+CMGD=%d", idx))
+	return err
+}
+
 func (m *Modem) ReadMessages() ([]Msg, error) {
 	var msgs []Msg
 	lines, err := m.Command("AT+CMGL=4")
