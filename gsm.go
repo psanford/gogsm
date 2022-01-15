@@ -97,7 +97,26 @@ func (m *Modem) handleAsyncLines() {
 
 func (m *Modem) lineReader() {
 	r := bufio.NewReader(m.conn)
+
 	for {
+		next, err := r.Peek(1)
+		// `>` is used for when the modem is expecting multiline
+		// input. we treat this as a full line for convenience
+		if len(next) == 1 && next[0] == '>' {
+			line, err := r.ReadString('>')
+			if err != nil {
+				m.readErr = err
+				close(m.lines)
+				return
+			}
+			select {
+			case m.lines <- line:
+			default:
+				// log.Printf("line dropped")
+			}
+			continue
+		}
+
 		line, err := r.ReadString('\n')
 		if err != nil {
 			m.readErr = err
@@ -115,6 +134,97 @@ func (m *Modem) lineReader() {
 			// log.Printf("line dropped")
 		}
 	}
+}
+
+func (m *Modem) SendSMS(number, message string) error {
+	pdus, err := sms.Encode([]byte(message), sms.AsSubmit, sms.To(number))
+	if err != nil {
+		return err
+	}
+
+	serviceCenterAddrLines, err := m.Command("AT+CSCA?")
+	if err != nil {
+		return fmt.Errorf("read csca err: %w", err)
+	}
+
+	var serviceCenterAddr string
+
+	for _, l := range serviceCenterAddrLines {
+		if strings.HasPrefix(l, "+CSCA:") {
+			pair := strings.TrimPrefix(l, "+CSCA:")
+			pair = strings.TrimSpace(pair)
+			parts := strings.SplitN(pair, ",", 2)
+			serviceCenterAddr = strings.ReplaceAll(parts[0], `"`, "")
+			break
+		}
+	}
+
+	for _, pdu := range pdus {
+		encoded, err := pdu.MarshalBinary()
+		if err != nil {
+			return err
+		}
+
+		smscAndTPDU := pdumode.PDU{
+			SMSC: pdumode.SMSCAddress{
+				Address: tpdu.NewAddress(tpdu.FromNumber(serviceCenterAddr)),
+			},
+			TPDU: encoded,
+		}
+
+		hex, err := smscAndTPDU.MarshalHexString()
+		if err != nil {
+			return err
+		}
+
+		_, err = fmt.Fprintf(m.conn, "AT+CMGW=%d\r", len(encoded))
+		if err != nil {
+			return err
+		}
+
+		// read `>` (multi-line input indicator)
+		<-m.lines
+
+		_, err = m.conn.Write([]byte(hex))
+		if err != nil {
+			return err
+		}
+		_, err = m.conn.Write([]byte{26}) // ctrl-z
+		if err != nil {
+			return err
+		}
+
+		lines, err := m.ReadUntilOkError()
+		if err != nil {
+			return err
+		}
+
+		time.Sleep(1 * time.Second)
+
+		_, err = m.Command("AT+CMGL=4")
+		if err != nil {
+			return err
+		}
+
+		for _, line := range lines {
+			if strings.HasPrefix(line, "+CMGW:") {
+				slotStr := strings.TrimPrefix(line, "+CMGW:")
+				slotStr = strings.TrimSpace(slotStr)
+				idx, err := strconv.Atoi(slotStr)
+				if err != nil {
+					return fmt.Errorf("parse CMGW line err: %s, <%s>", err, line)
+				}
+
+				_, err = m.Command(fmt.Sprintf("AT+CMSS=%d", idx))
+				if err != nil {
+					return fmt.Errorf("send msg err: %s", err)
+				}
+				break
+			}
+		}
+	}
+
+	return nil
 }
 
 func (m *Modem) Command(d string) ([]string, error) {
@@ -310,7 +420,7 @@ func (m *Modem) Connect() error {
 	}
 
 	// PDU mode
-	m.Command("AT+CMFG=0")
+	m.Command("AT+CMGF=0")
 	// _, err = m.Command("AT+CMFG=0")
 	// if err != nil {
 	// 	return err
